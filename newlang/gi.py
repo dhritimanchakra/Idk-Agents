@@ -3,13 +3,14 @@ from langchain_groq import ChatGroq
 from dotenv import load_dotenv
 import os
 import getpass
-from langchain_core.messages import HumanMessage,AIMessage,SystemMessage,ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph import StateGraph,START,END
+from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel
-from typing import Optional,Annotated
+from typing import Optional, Annotated
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
 from langchain_core.runnables import RunnableConfig
 from langgraph.store.base import BaseStore
 from langchain_openai import ChatOpenAI
@@ -17,15 +18,13 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
 from langchain_core.tools import tool, InjectedToolCallId
 
-
 load_dotenv()
-os.environ["LANGCHAIN_TRACING_V2"]="true"
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
 
 if not os.environ.get("GROQ_API_KEY"):
     os.environ["GROQ_API_KEY"] = getpass.getpass("Enter API key for Groq: ")
 
-
-llm=ChatGroq(
+llm = ChatGroq(
     model="gemma2-9b-it",
     temperature=0,
     max_tokens=None,
@@ -56,302 +55,262 @@ prompt_template = ChatPromptTemplate.from_messages([
         - Get location weather
 
         Your responsibilities span across three key roles:
-        1. **Planner** - Break down the user's travel query into actionable steps needed to fulfill it.
-        2. **Tool Caller** - Make appropriate tool calls for each step in the plan.
-        3. **Verifier** - After each tool call and at the end of the plan, verify that the retrieved data is complete, correct, and sufficient.
+        1. Planner - Break down the user's travel query into actionable steps needed to fulfill it.
+        2. Tool Caller - Make appropriate tool calls for each step in the plan.
+        3. Verifier - After each tool call and at the end of the plan, verify that the retrieved data is complete, correct, and sufficient.
 
-        ###  Step-by-Step Workflow:
+        Step-by-Step Workflow:
 
-        1. **Planning Phase**:
-        - When a user asks for a travel plan (e.g., "Plan my trip from Mumbai to Bali"), begin by analyzing the request.
-        - Generate a structured set of steps required to build the itinerary (e.g., find flights, check hotels, get local activities, etc.).
+        1. Planning Phase:
+        - When a user asks for a travel plan, begin by analyzing the request.
+        - Generate a structured set of steps required to build the itinerary.
         - Do not make any assumptions or fetch data at this stage.
 
-        2. **Execution Phase**:
+        2. Execution Phase:
         - For each step in the plan:
             a. Decide which tool to use.
             b. Call the appropriate tool.
-            c. Act as a verifier: Check if the tool result fulfills the step. If incomplete, call again with refined inputs.
+            c. Act as a verifier: Check if the tool result fulfills the step.
         - Continue until all steps have valid data.
 
-        3. **Final Verification Phase**:
+        3. Final Verification Phase:
         - After all steps are completed, review the full plan.
         - Confirm all necessary data is present and consistent.
-        - If anything is missing or ambiguous, repeat tool calls as needed to complete the plan.
 
-        4. **Explanation Phase**:
-        - Once verification is done, summarize the final travel plan in a natural, helpful, and friendly way for the user.
-        - Ensure the explanation should be told from the perspective of travel planner and not an tool caller
+        4. Explanation Phase:
+        - Once verification is done, summarize the final travel plan in a natural, helpful, and friendly way.
+        - Ensure the explanation is told from the perspective of a travel planner.
 
-        
-
-        -  Only use the tools you are explicitly given access to.
-        - Do **not** fabricate or hallucinate information.
+        Rules to Follow:
+        - Only use the tools you are explicitly given access to.
+        - Do not fabricate or hallucinate information.
         - If a user asks for something outside tool capabilities, politely say you cannot fulfill it.
-        - Ask follow-up questions **only** if you have a tool to answer the response.
-        -  Be precise, transparent, and accurate in all steps — like a professional travel concierge.
+        - Ask follow-up questions only if you have a tool to answer the response.
 
-        Your goal is to **plan**, **execute**, and **validate** travel itineraries in a step-by-step, tool-grounded, and trustworthy manner.
+        Structured Data:
 
-        
-
-        Use the following structured data to verify or fulfill user queries **before** making tool calls. 
-        If the data already answers the user’s request, use it. 
-        Do not duplicate tool calls unnecessarily.
-
-        
+        Flights:
         {flights}   
 
-        
+        Hotels:
         {hotels}
 
-        **Activities**:
+        Activities:
         {activities}
 
-         **Weather**:
+        Weather:
         {weather}
-
-        This data is meant to:
-        - Help fulfill requests using already available info.
-        - Allow you to verify correctness before or after tool usage.
-        - Save unnecessary calls by reusing available data.
         """
     ),
     ("user", "Hello!"),
     ("ai", "Hello!"),
     MessagesPlaceholder("messages"),
 ])
-user_summary_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            """
-            You are a memory assistant for a user/human. 
-            Your job is to keep a compact summary of important details explicitly expressed by the user.
-            
-            You are given:
-            - The current user summary.
-            - A full list of user messages (what user said) exchanged with assistant since the last update. List doesn't include any of assistant messages.
 
-            Here is the current user summary:
-            {summary}
+user_summary_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """
+        You are a memory assistant for a user/human. 
+        Your job is to keep a compact summary of important details explicitly expressed by the user.
+        
+        Current user summary:
+        {summary}
 
-            Note:                 
-            - If you see question in the messages, you should not answer it.
-            - Your job is to analyse all the messages and based on your understanding of messages update summary if required.
-            - You should not add any new information that is not explicitly stated by the user in messages.
-            - You don't need to update summary if you don't find anything to update as such.
+        Update rules:
+        - Extract only facts, preferences, goals, or experiences explicitly stated.
+        - Keep previously relevant summary points.
+        - Be concise and factual.
+        - Do not add information based on tool calls or assistant replies.
+        """
+    ),
+    MessagesPlaceholder(variable_name="messages"),
+])
 
-            Update the above user summary as follows (if needed). Carefully follow these rules when updating the summary:
-            - Extract only facts, preferences, goals, or experiences that the user explicitly stated in their own messages.
-            - If the user expresses any physical or emotional experiences, include a brief one-liner.
-            - Keep all previously relevant summary points — do not remove good info unless it's outdated or corrected by user.
-            - IMPORTANT: **Do not remove or modify unrelated parts of the summary unless the new messages explicitly relate to or update them.**
-            - If you add something new to the summary, return the full updated summary by preserving existing relevant entries and appending new ones.
-            - Avoid restating literal facts (e.g., “User's name is Varun”) if richer insights exist (e.g., “Varun loves exploring cities and their culture”).
-            - Do not add information based on tool calls, system messages, or any content not clearly from the user.
-            - Be concise. Write as if another LLM will use this summary — keep it compact, factual, and clear.
-            - Use consistent phrasing for all new entries: e.g., "User mentioned...", "User likes...", "User asked about...", "User prefers...", "User shared...", etc.
-            - Do not end the summary with a question, suggestion, or incomplete sentence.
+agent_summary_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """
+        You are a memory assistant for an AI agent/assistant.
+        Your job is to maintain a concise summary of the assistant's useful contributions.
 
-            DO NOT add:
-            - Anything the user did not clearly say in their message.
-            - Assistant-generated ideas, guesses, or completions.
-            - Paraphrases of the assistant's replies.
-            """
-        ),
-        MessagesPlaceholder(variable_name="messages"),
-    ]
-)
-agent_summary_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            """
-            You are a memory assistant for an AI agent/assistant.
-            Your job is to maintain a concise, high-signal summary of the assistant's useful contributions across a session.
+        Current agent summary:
+        {agent_summary}
 
-            You are given:
-            - The current agent summary
-            - A full list of messages exchanged between the user and the AI assistant since the last update
-
-            Here is the current agent summary:
-            {agent_summary}
-
-            Update the summary using the following principles:
-
-            - Include only the assistant’s most **helpful**, **actionable**, or **user-specific** suggestions, assumptions, instructions, or conclusions
-            - Use phrasing like **"Agent suggested..."**, **"Agent recommended..."**, or **"Agent explained..."** when adding new entries
-            - **Do not include general world knowledge or common facts** unless the assistant applied it in a uniquely helpful or contextual way
-            - If the assistant revises or contradicts an earlier response, replace the outdated part
-            - Do not repeat already summarized points
-            - Remove obsolete, incorrect, or low-value information
-            - Focus on reusable insights or decisions the assistant is building on
-            - IMPORTANT: **Do not remove or modify unrelated existing summary points unless clearly revised or invalidated by the assistant in the new messages.**
-            - If you add something new to the summary, return the full updated summary by preserving existing relevant entries and appending new ones.
-            - Be concise and structured for quick reference by another LLM
-            - Read user's messages only for context. Do not include anything that comes solely from the user. Only assistant-authored content should appear in the summary.
-            - Ignore tool calls or system messages
-            - It’s okay if there’s nothing new to summarize — do not add filler or low-value content
-            """
-        ),
-        MessagesPlaceholder(variable_name="messages"),
-    ]
-)
+        Update principles:
+        - Include only the assistant’s most helpful, actionable, or user-specific suggestions.
+        - Use phrasing like "Agent suggested..." or "Agent recommended...".
+        - Do not include general facts.
+        - Focus on reusable insights or decisions.
+        """
+    ),
+    MessagesPlaceholder(variable_name="messages"),
+])
 
 @tool
 def search_flights(from_city: str, to_city: str, date: str, tool_call_id: Annotated[str, InjectedToolCallId]):
-    """
-    Tool: search_flights
-    Description: Search for flights based on departure, destination, date
-
-    Parameters:
-        from_city (str): Departure city.
-        to_city (str): Destination city.
-        date (str): Date of travel in YYYY-MM-DD format.
-
-    Returns:
-        str: A response of available flight options.
-
-    """
-    content=f"Flights from {from_city} to {to_city} on {date}:\n"
-    content+="- IndiGo 6E-123, 10:00 AM to 4:00 PM, $250\n"
+    """Search for flights based on departure, destination, and date."""
+    content = f"Flights from {from_city} to {to_city} on {date}:\n- IndiGo 6E-123, 10:00 AM to 4:00 PM, $250\n"
     return Command(update={
         "flights": content,
         "messages": [
             ToolMessage(
-                f"Here are some flights options for your trip. {content}", 
+                f"Flight options: {content}", 
                 tool_call_id=tool_call_id
             )
         ]
     })
 
-
-@tool
-def find_hotels(location:str,checkin:str,checkout:str,toll_call_id:Annotated[str, InjectedToolCallId]):
-    """
-    Tool: find_hotels
-    Description: Find hotel options based on location, check-in/out dates, and optional budget.
-
-    Parameters:
-        location (str): City or region where hotel is needed.
-        checkin (str): Check-in date in YYYY-MM-DD format.
-        checkout (str): Check-out date in YYYY-MM-DD format.
-
-    Returns:
-        str: A summary of hotel options.
-
-    """
-
-    content=f"{location}: Bali Beach Resort, ₹90/night, 4.3⭐ (Check-in: {checkin}, Check-out: {checkout})"
-    return Command(update={
-        "hotels": content,
-        "messages": [
-            ToolMessage(f"Here are some hotel options for your trip. {content}", tool_call_id=tool_call_id)
-        ]
-    })
-
-
 @tool
 def find_hotels(location: str, checkin: str, checkout: str, tool_call_id: Annotated[str, InjectedToolCallId]):
-    """
-    Tool: find_hotels
-    Description: Find hotel options based on location, check-in/out dates, and optional budget.
-
-    Parameters:
-        location (str): City or region where hotel is needed.
-        checkin (str): Check-in date in YYYY-MM-DD format.
-        checkout (str): Check-out date in YYYY-MM-DD format.
-
-    Returns:
-        str: A summary of hotel options.
-
-    """
-
-    content=f"{location}: Bali Beach Resort, ₹90/night, 4.3⭐ (Check-in: {checkin}, Check-out: {checkout})"
+    """Find hotel options based on location and dates."""
+    content = f"{location}: Bali Beach Resort, ₹90/night, 4.3 (Check-in: {checkin}, Check-out: {checkout})"
     return Command(update={
         "hotels": content,
         "messages": [
-            ToolMessage(f"Here are some hotel options for your trip. {content}", tool_call_id=tool_call_id)
+            ToolMessage(f"Hotel options: {content}", tool_call_id=tool_call_id)
         ]
     })
 
 @tool
 def suggest_activities(location: str, interests: list, tool_call_id: Annotated[str, InjectedToolCallId]):
-    """
-    Tool: suggest_activities
-    Description: Suggests activities in a location based on user interests.
-
-    Parameters:
-        location (str): Travel destination (e.g., "Bali").
-        interests (list): List of interest categories (e.g., ["beach", "culture"]).
-
-    Returns:
-        str: A list of activities relevant to the location and interests.
-
-    """
+    """Suggests activities in a location based on user interests."""
     all_activities = {
-        "beach": f"{location}: Beach Day at Seminyak – Relax on white sands.",
-        "culture": f"{location}: Visit Uluwatu Temple – Explore Balinese culture.",
-        "nature": f"{location}: Tegallalang Rice Terrace – Scenic rice fields walk.",
-        "adventure": f"{location}: Mount Batur Sunrise Hike – Early morning volcano trek."
+        "beach": f"{location}: Beach Day at Seminyak.",
+        "culture": f"{location}: Visit Uluwatu Temple.",
+        "nature": f"{location}: Tegallalang Rice Terrace.",
+        "adventure": f"{location}: Mount Batur Sunrise Hike."
     }
 
     suggestions = [all_activities[i] for i in interests if i in all_activities]
-    content="\n".join(suggestions) or "No activities matched the given interests."
+    content = "\n".join(suggestions) or "No activities matched the given interests."
     return Command(update={
         "activities": content,
         "messages": [
-            ToolMessage(f"Here are some activities options for your trip. {content}", tool_call_id=tool_call_id)
+            ToolMessage(f"Activity options: {content}", tool_call_id=tool_call_id)
         ]
     })
 
 @tool
 def get_location_weather(location: str, date: str, tool_call_id: Annotated[str, InjectedToolCallId]):
-    """
-    Tool: get_location_weather
-    Description: Returns test weather info for a location on a given date.
-
-    Parameters:
-        location (str): Name of the city or place (e.g., "Bali").
-        date (str): Target date in YYYY-MM-DD format.
-
-    Returns:
-        str: A short forecast.
-    """
-    content1=f"Weather in {location} on {date}: 29°C, partly cloudy, 70% humidity, 20% chance of rain."
-    content2=f"Weather in {location} on {date}: 18°C, light rain, 85% humidity, 60% chance of rain."
-    content3=f"Weather in {location} on {date}: 25°C, mostly sunny, 60% humidity, 10% chance of rain."
+    """Returns weather info for a location on a given date."""
     if location.lower() == "bali":
-        return Command(update={
-            "weather": content1,
-            "messages": [
-                ToolMessage(f"Here is the weather for your given location. {content1}", tool_call_id=tool_call_id)
-            ]
-        })
+        content = f"Weather in {location} on {date}: 29°C, partly cloudy."
     elif location.lower() == "london":
-        return Command(update={
-            "weather": content2,
-            "messages": [
-                ToolMessage(f"Here is the weather for your given location. {content2}", tool_call_id=tool_call_id)
-            ]
-        })
+        content = f"Weather in {location} on {date}: 18°C, light rain."
     else:
-        return Command(update={
-            "weather": content3,
-            "messages": [
-                ToolMessage(f"Here is the weather for your given location. {content3}", tool_call_id=tool_call_id)
-            ]
-        })
+        content = f"Weather in {location} on {date}: 25°C, mostly sunny."
     
+    return Command(update={
+        "weather": content,
+        "messages": [
+            ToolMessage(f"Weather info: {content}", tool_call_id=tool_call_id)
+        ]
+    })
 
-tools=[search_flights,find_hotels,suggest_activities,get_location_weather]
-tool_node=ToolNode(tools)
-llm_with_tools=llm.bind_tools(tools)
-chain=prompt_template|llm_with_tools
-user_summary_chain=user_summary_prompt|llm
-agent_summary_chain=agent_summary_prompt|llm
+tools = [search_flights, find_hotels, suggest_activities, get_location_weather]
+tool_node = ToolNode(tools)
+llm_with_tools = llm.bind_tools(tools)
 
+chain = prompt_template | llm_with_tools
+user_summary_chain = user_summary_prompt | llm
+agent_summary_chain = agent_summary_prompt | llm
+
+class State(BaseModel):
+    messages: Annotated[list, add_messages]
+    language: Optional[str] = None
+    flights: Optional[str] = None
+    hotels: Optional[str] = None
+    activities: Optional[str] = None
+    weather: Optional[str] = None
+
+graph_builder = StateGraph(State)
+user_summary_namespace = "User's Summary"
+agent_summary_namespace = "Agent's Summary"
+
+def llm_call(state: State, config: RunnableConfig, *, store: BaseStore):
+    user_id = config["configurable"]["user_id"]
+    user_summary = store.search((user_id, user_summary_namespace))
+    user_summary_str = concatenate_memories(user_summary)
+    agent_summary = store.search((user_id, agent_summary_namespace))
+    agent_summary_str = concatenate_memories(agent_summary)
+    
+    new_messages = chain.invoke({
+        "messages": state.messages, 
+        "language": state.language, 
+        "user_summary": user_summary_str, 
+        "agent_summary": agent_summary_str,
+        "flights": state.flights,
+        "hotels": state.hotels,
+        "activities": state.activities,
+        "weather": state.weather
+    })
+    return {"messages": [new_messages]}
+
+def concatenate_memories(items):
+    return "\n".join(
+        item.dict()["value"]["memory"]
+        for item in items
+        if "memory" in item.dict().get("value", {})
+    )
+
+def update_user_memory(state: State, config: RunnableConfig, *, store: BaseStore):
+    user_id = config["configurable"]["user_id"]
+    namespace = (user_id, user_summary_namespace)
+    memory_id = f"{user_id}-summary"
+    prev_summary = store.search(namespace)
+    prev_summary_str = concatenate_memories(prev_summary)
+    human_messages = [msg for msg in state.messages if isinstance(msg, HumanMessage)]
+    memory = user_summary_chain.invoke({"messages": human_messages, "summary": prev_summary_str})
+    memory_text = memory.content if hasattr(memory, "content") else memory
+    store.put(namespace, memory_id, {"memory": memory_text})
+
+def update_agent_memory(state: State, config: RunnableConfig, *, store: BaseStore):
+    user_id = config["configurable"]["user_id"]
+    namespace = (user_id, agent_summary_namespace)
+    memory_id = f"{user_id}-agent-summary"
+    prev_summary = store.search(namespace)
+    prev_summary_str = concatenate_memories(prev_summary)
+    memory = agent_summary_chain.invoke({"messages": state.messages, "agent_summary": prev_summary_str})
+    memory_text = memory.content if hasattr(memory, "content") else memory
+    store.put(namespace, memory_id, {"memory": memory_text})
+
+def go_to(state: State):
+    last_message = state.messages[-1]
+    if last_message.tool_calls:
+        return "tools"
+    return ["update_user_memory", "update_agent_memory"]
+
+graph_builder.add_node("llm_call", llm_call)
+graph_builder.add_node("tools", tool_node)
+graph_builder.add_node("update_user_memory", update_user_memory)
+graph_builder.add_node("update_agent_memory", update_agent_memory)
+
+graph_builder.add_edge(START, "llm_call")
+graph_builder.add_conditional_edges(
+    "llm_call", 
+    go_to, 
+    ["tools", "update_user_memory", "update_agent_memory"]
+)
+graph_builder.add_edge("tools", "llm_call")
+graph_builder.add_edge("update_user_memory", END)
+graph_builder.add_edge("update_agent_memory", END)
+
+memory = InMemorySaver()
+in_memory_store = InMemoryStore()
+graph = graph_builder.compile(checkpointer=memory, store=in_memory_store)
+
+config = {"configurable": {"thread_id": "1", "user_id": "1"}}
+
+response = graph.invoke({
+    "messages": [
+        HumanMessage(content="Hi can you tell me about the weather in bali from 25th July 2025 to 30th July 2025?")
+    ], 
+    "language": "English"
+}, config=config)
+
+for message in response["messages"]:
+    print(message.content)
 
 
 print("Hello")
